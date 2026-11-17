@@ -1,4 +1,5 @@
 import { useEffect, useMemo } from 'react'
+import { CippIcons } from '../../utils/icon-registry'
 import {
   Alert,
   Box,
@@ -9,26 +10,15 @@ import {
   DialogContentText,
   DialogTitle,
   Stack,
+  Tooltip,
   Typography,
 } from '@mui/material'
-import {
-  CheckCircle,
-  NewReleases,
-  Schedule,
-  Layers,
-  Sell,
-  HelpOutline,
-  Refresh,
-  CloudSync,
-  RestartAlt,
-  Save,
-  SwapHoriz,
-} from '@mui/icons-material'
 import { Grid } from '@mui/system'
 import { useForm, useWatch } from 'react-hook-form'
 import CippFormComponent from '../CippComponents/CippFormComponent'
 import CippButtonCard from '../CippCards/CippButtonCard'
 import { CippInfoBar } from '../CippCards/CippInfoBar'
+import { CippDataTable } from '../CippTable/CippDataTable'
 import { ApiGetCall, ApiPostCall } from '../../api/ApiCall'
 import { CippApiResults } from '../CippComponents/CippApiResults'
 import { useDialog } from '../../hooks/use-dialog'
@@ -39,6 +29,27 @@ const channelLabels = {
   nightly: { label: 'Nightly', color: 'info' },
   unknown: { label: 'Unknown', color: 'default' },
 }
+
+// What a channel's provenance can vouch for: main requires pull requests, dev and nightly take
+// direct pushes, branch builds come from anywhere.
+const channelTrust = {
+  latest: { label: 'Stable', provenance: '' },
+  dev: {
+    label: 'Development',
+    provenance: 'Dev',
+    alert:
+      'receives changes as they land on the dev branch, before release review. Use it for testing or at the direction of the helpdesk.',
+  },
+  nightly: {
+    label: 'Development',
+    provenance: 'Dev',
+    alert:
+      'is built once a day from the dev branch, before release review. Use it for testing or at the direction of the helpdesk.',
+  },
+}
+
+const provenanceSuffix = (channel, isBuild) =>
+  isBuild ? 'Preview' : (channelTrust[channel]?.provenance ?? '')
 
 const intervalOptions = [
   { label: 'Disabled', value: '0' },
@@ -82,6 +93,19 @@ const truncateDigest = (digest) => {
   if (digest.startsWith('sha256:')) return `sha256:${digest.slice(7, 19)}…`
   return digest.length > 20 ? `${digest.slice(0, 20)}…` : digest
 }
+
+// Same rendering for the channel image and the running image: state, reason underneath.
+const provenanceValue = (state, reason, suffix) =>
+  isUnset(state) ? null : (
+    <>
+      {state === 'Verified' && suffix ? `Verified · ${suffix}` : state}
+      {reason && (
+        <Typography variant="caption" component="div">
+          {reason}
+        </Typography>
+      )}
+    </>
+  )
 
 const relativeTime = (epochSeconds) => {
   if (!epochSeconds) return null
@@ -133,6 +157,10 @@ export const CippContainerManagement = () => {
 
   const data = containerStatus.data?.Results
   const updateSettings = data?.UpdateSettings
+  const imageUnverified = ['Failed', 'Unverifiable'].includes(updateSettings?.AttestationState)
+  // The image App Service keeps running failing its own check outranks an unverified channel.
+  const runningImageFailed = updateSettings?.RunningAttestationState === 'Failed'
+  const imagePinned = !isUnset(updateSettings?.PinnedDigest)
 
   // Presentation for a channel value. Standard channels get their friendly name; a branch build
   // shows its tag, which is the thing that matches the branch it came from. Kept here rather
@@ -144,10 +172,10 @@ export const CippContainerManagement = () => {
   // stragglers. Remove this once none remain.
   const prettyChannelLabel = (option) => {
     const value = option?.value ?? option
-    if (channelLabels[value]) return channelLabels[value].label
+    if (channelTrust[value]) return `${value} · ${channelTrust[value].label}`
     const pinned = /-([0-9a-f]{7})$/.exec(value ?? '')
     if (pinned)
-      return `${value.replace(/-[0-9a-f]{7}$/, '')} — pinned ${pinned[1]}`
+      return `${value.replace(/-[0-9a-f]{7}$/, '')} — pinned ${pinned[1]}`;
     return value
   }
 
@@ -163,7 +191,7 @@ export const CippContainerManagement = () => {
   const selectedChannelValue = selectedChannel?.value ?? selectedChannel
   const buildChannelSelected = isBuildChannel(selectedChannelValue)
 
-  // Preferred check time and auto-restart only mean anything while periodic checks are on.
+  // Preferred restart time and auto-restart only mean anything while periodic checks are on.
   const watchedInterval = useWatch({
     control: updateSettingsForm.control,
     name: 'CheckInterval',
@@ -267,6 +295,25 @@ export const CippContainerManagement = () => {
       { label: 'Image Built (UTC)', value: formatUtcDate(data?.BuildDate) },
       { label: 'Container Image', value: data?.CurrentImage },
       { label: 'App Service', value: data?.SiteName },
+      {
+        label: 'Pinned Digest',
+        value: imagePinned ? (
+          <Tooltip title={updateSettings.PinnedDigest}>
+            <span>{truncateDigest(updateSettings.PinnedDigest)}</span>
+          </Tooltip>
+        ) : null,
+      },
+      {
+        label: 'Provenance',
+        value: provenanceValue(
+          updateSettings?.RunningAttestationState,
+          updateSettings?.RunningAttestationReason,
+          provenanceSuffix(
+            data?.CurrentChannel,
+            isBuildChannel(data?.CurrentChannel)
+          )
+        ),
+      },
     ])
 
     const remoteDetails = knownProperties([
@@ -276,24 +323,43 @@ export const CippContainerManagement = () => {
         value: formatUtcDate(updateSettings?.RemoteBuildDate),
       },
       { label: 'Digest', value: truncateDigest(updateSettings?.RemoteDigest) },
+      {
+        label: 'Provenance',
+        value: provenanceValue(
+          updateSettings?.AttestationState,
+          updateSettings?.AttestationReason,
+          provenanceSuffix(
+            data?.ConfiguredChannel,
+            isBuildChannel(data?.ConfiguredChannel)
+          )
+        ),
+      },
     ])
 
-    const updateState = !updateSettings?.LastCheck
-      ? { label: 'Never checked', color: 'primary', icon: <HelpOutline /> }
-      : updateSettings.UpdateAvailable
-        ? { label: 'Update available', color: 'info', icon: <NewReleases /> }
-        : { label: 'Up to date', color: 'success', icon: <CheckCircle /> }
+    const updateState = runningImageFailed
+      ? { label: 'Running image unverified', color: 'error', icon: <CippIcons.GppBad /> }
+      : !updateSettings?.LastCheck
+        ? { label: 'Never checked', color: 'primary', icon: <CippIcons.HelpOutlined /> }
+        : imageUnverified
+          ? {
+              label: updateSettings.UpdateAvailable ? 'Update unverified' : 'Up to date, unverified',
+              color: 'warning',
+              icon: <CippIcons.GppBad />,
+            }
+          : updateSettings.UpdateAvailable
+            ? { label: 'Update available', color: 'info', icon: <CippIcons.NewReleases /> }
+            : { label: 'Up to date', color: 'success', icon: <CippIcons.CheckCircle /> }
 
     return [
       {
-        icon: <Layers />,
+        icon: <CippIcons.Layers />,
         name: 'Release Channel',
         data: channelInfo.label,
         color: channelInfo.color === 'default' ? 'primary' : channelInfo.color,
         toolTip: `Running image tag: ${data?.ImageTag ?? 'unknown'}`,
       },
       {
-        icon: <Sell />,
+        icon: <CippIcons.Sell />,
         name: 'App Version',
         data: commit ? `${version} @${commit}` : version,
         color: 'primary',
@@ -306,12 +372,17 @@ export const CippContainerManagement = () => {
         name: 'Update Status',
         data: updateState.label,
         color: updateState.color,
+        toolTip: runningImageFailed
+          ? updateSettings.RunningAttestationReason
+          : imageUnverified
+            ? updateSettings.AttestationReason
+            : undefined,
         offcanvas: remoteDetails.length
           ? { title: 'Latest on this channel', propertyItems: remoteDetails }
           : undefined,
       },
       {
-        icon: <Schedule />,
+        icon: <CippIcons.Schedule />,
         name: 'Last Checked',
         data: relativeTime(updateSettings?.LastCheck) ?? 'Never',
         color: 'primary',
@@ -320,7 +391,15 @@ export const CippContainerManagement = () => {
           : 'No update check has run on this instance yet',
       },
     ]
-  }, [data, updateSettings, channelInfo.label, channelInfo.color])
+  }, [
+    data,
+    updateSettings,
+    imageUnverified,
+    runningImageFailed,
+    imagePinned,
+    channelInfo.label,
+    channelInfo.color,
+  ])
 
   const channelChangePending =
     data?.ConfiguredChannel && data.ConfiguredChannel !== data.CurrentChannel
@@ -342,7 +421,7 @@ export const CippContainerManagement = () => {
 
         {/* Page-level state. Static explanation lives on the cards as helper text; an Alert
             only appears when there is something to act on. */}
-        {(channelChangePending || updateSettings?.UpdateAvailable) && (
+        {(channelChangePending || updateSettings?.UpdateAvailable || imageUnverified) && (
           <Stack spacing={2}>
             {channelChangePending && (
               <Alert severity="warning">
@@ -352,11 +431,22 @@ export const CippContainerManagement = () => {
                 to apply.
               </Alert>
             )}
-            {updateSettings?.UpdateAvailable && (
-              <Alert severity="info">
-                A container update is available. Restart the container to pull
-                the latest image.
+            {imageUnverified ? (
+              <Alert severity="warning">
+                The latest image on your channel did not pass provenance
+                verification.
+                {updateSettings?.UpdateAvailable &&
+                  (imagePinned
+                    ? ' It will not be applied, and restarting the container keeps the pinned image.'
+                    : ' It will not be applied automatically, and restarting the container pulls it anyway.')}
               </Alert>
+            ) : (
+              updateSettings?.UpdateAvailable && (
+                <Alert severity="info">
+                  A container update is available. Restart the container to pull
+                  the latest image.
+                </Alert>
+              )
             )}
           </Stack>
         )}
@@ -367,15 +457,16 @@ export const CippContainerManagement = () => {
         <Stack
           direction="row"
           spacing={1}
-          justifyContent="flex-end"
-          flexWrap="wrap"
           useFlexGap
-        >
+          sx={{
+            justifyContent: "flex-end",
+            flexWrap: "wrap"
+          }}>
           {/* Re-reads the Status endpoint only. Distinct from "Check for Updates", which hits the
               container registry and can trip auto-restart when an update is found. */}
           <Button
             variant="text"
-            startIcon={<Refresh />}
+            startIcon={<CippIcons.Refresh />}
             onClick={() => containerStatus.refetch()}
             disabled={containerStatus.isFetching}
           >
@@ -383,7 +474,7 @@ export const CippContainerManagement = () => {
           </Button>
           <Button
             variant="outlined"
-            startIcon={<CloudSync />}
+            startIcon={<CippIcons.CloudSync />}
             onClick={() => checkDialog.handleOpen()}
             disabled={updateCheckAction.isPending}
           >
@@ -392,7 +483,7 @@ export const CippContainerManagement = () => {
           <Button
             variant="outlined"
             color="warning"
-            startIcon={<RestartAlt />}
+            startIcon={<CippIcons.RestartAlt />}
             onClick={() => restartDialog.handleOpen()}
             disabled={restartAction.isPending}
           >
@@ -415,7 +506,7 @@ export const CippContainerManagement = () => {
                 >
                   <Button
                     variant="contained"
-                    startIcon={<SwapHoriz />}
+                    startIcon={<CippIcons.SwapHoriz />}
                     onClick={handleUpdateChannel}
                     disabled={channelAction.isPending}
                   >
@@ -426,8 +517,8 @@ export const CippContainerManagement = () => {
             >
               <Stack spacing={2}>
                 <Typography {...helperText}>
-                  Which image tag this instance runs. The new image is pulled on
-                  the next restart.
+                  Which image tag this instance runs. Switching channels
+                  restarts the container onto the new image.
                 </Typography>
                 {/*
                   Options come from ListChannels rather than a static list so branch builds appear
@@ -463,9 +554,16 @@ export const CippContainerManagement = () => {
                     build from an unmerged branch. It does not receive updates,
                     and it is deleted when its branch is — after which this
                     instance cannot start until you switch back to a standard
-                    channel. Use it for testing only.
+                    channel. Use it for testing or at the direction of the helpdesk.
                   </Alert>
                 )}
+                {!buildChannelSelected &&
+                  channelTrust[selectedChannelValue]?.alert && (
+                    <Alert severity="warning">
+                      <strong>{selectedChannelValue}</strong>{' '}
+                      {channelTrust[selectedChannelValue].alert}
+                    </Alert>
+                  )}
                 <CippApiResults apiObject={channelAction} />
               </Stack>
             </CippButtonCard>
@@ -485,7 +583,7 @@ export const CippContainerManagement = () => {
                 >
                   <Button
                     variant="contained"
-                    startIcon={<Save />}
+                    startIcon={<CippIcons.Save />}
                     onClick={handleSaveUpdateSettings}
                     disabled={updateSettingsAction.isPending}
                   >
@@ -515,7 +613,7 @@ export const CippContainerManagement = () => {
                 <CippFormComponent
                   type="autoComplete"
                   name="CheckTime"
-                  label="Preferred Check Time"
+                  label="Preferred Restart Time"
                   options={hourOptions}
                   formControl={updateSettingsForm}
                   creatable={false}
@@ -532,7 +630,9 @@ export const CippContainerManagement = () => {
                 />
 
                 {checksDisabled && (
-                  <Typography variant="caption" color="text.secondary">
+                  <Typography variant="caption" sx={{
+                    color: "text.secondary"
+                  }}>
                     Checks are off, so the preferred time and auto-restart have
                     no effect. You can still check manually with Check for
                     Updates.
@@ -542,6 +642,24 @@ export const CippContainerManagement = () => {
                 <CippApiResults apiObject={updateSettingsAction} />
               </Stack>
             </CippButtonCard>
+          </Grid>
+
+          <Grid size={{ xs: 12 }}>
+            {/* Version transitions recorded at warmup - answers "when did this instance land
+                on the current build, and what was it on before?" without reading container
+                logs. Rows come newest first from the Status payload. */}
+            <CippDataTable
+              title="Update History"
+              data={data?.UpgradeHistory ?? []}
+              isFetching={containerStatus.isFetching}
+              refreshFunction={() => containerStatus.refetch()}
+              simpleColumns={[
+                'RecordedAt',
+                'PreviousVersion',
+                'NewVersion',
+                'ImageTag',
+              ]}
+            />
           </Grid>
         </Grid>
       </Stack>
@@ -582,7 +700,7 @@ export const CippContainerManagement = () => {
           <Button
             variant="contained"
             color={autoUpdateEnabled ? 'warning' : 'primary'}
-            startIcon={autoUpdateEnabled ? <RestartAlt /> : <CloudSync />}
+            startIcon={autoUpdateEnabled ? <CippIcons.RestartAlt /> : <CippIcons.CloudSync />}
             onClick={handleCheckUpdate}
             disabled={updateCheckAction.isPending}
           >
@@ -604,11 +722,27 @@ export const CippContainerManagement = () => {
         <DialogTitle>Restart container?</DialogTitle>
         <DialogContent>
           <DialogContentText sx={{ mb: 2 }}>
-            CIPP will be briefly unavailable while the container restarts. The
-            newest image on the <strong>{channelInfo.label}</strong> channel is
-            pulled as it comes back up — a restart always updates to the latest
-            image on the channel, whatever the reason for it.
+            CIPP will be briefly unavailable while the container restarts.{' '}
+            {imagePinned ? (
+              <>
+                It comes back on the pinned image, moved to the newest image on
+                the <strong>{channelInfo.label}</strong> channel only if that
+                image passed provenance verification.
+              </>
+            ) : (
+              <>
+                The newest image on the <strong>{channelInfo.label}</strong>{' '}
+                channel is pulled as it comes back up — a restart always updates
+                to the latest image on the channel, whatever the reason for it.
+              </>
+            )}
           </DialogContentText>
+          {!imagePinned && updateSettings?.AttestationState === 'Failed' && updateSettings?.UpdateAvailable && (
+            <Alert severity="warning" sx={{ mb: 2 }}>
+              The pending image did not pass provenance verification, and
+              restarting will pull it anyway.
+            </Alert>
+          )}
           <CippApiResults apiObject={restartAction} />
         </DialogContent>
         <DialogActions>
@@ -616,7 +750,7 @@ export const CippContainerManagement = () => {
           <Button
             variant="contained"
             color="warning"
-            startIcon={<RestartAlt />}
+            startIcon={<CippIcons.RestartAlt />}
             onClick={handleRestart}
             disabled={restartAction.isPending}
           >
@@ -625,7 +759,7 @@ export const CippContainerManagement = () => {
         </DialogActions>
       </Dialog>
     </>
-  )
+  );
 }
 
 export default CippContainerManagement

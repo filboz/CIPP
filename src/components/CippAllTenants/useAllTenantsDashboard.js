@@ -1,5 +1,8 @@
 import { useMemo } from 'react'
 import { ApiGetCall } from '../../api/ApiCall.jsx'
+import { usePermissions } from '../../hooks/use-permissions'
+import { useMultiTenantScope } from '../../hooks/use-multi-tenant-scope'
+import { isTenantGroup, tenantScope } from '../../utils/tenant-selection'
 
 // Some CIPP endpoints return a bare array, others wrap in { Results: [...] }. Normalise both.
 export const asArray = (payload) => {
@@ -74,16 +77,18 @@ export const deriveSecureScoreSummary = (rows, displayNameByDomain = new Map()) 
     .sort((a, b) => a[0].localeCompare(b[0]))
     .map(([date, value]) => ({
       date,
-      percent: value.count ? Math.round((value.total / value.count) * 10) / 10 : 0,
+      percent: value.count ? Math.round((value.total / value.count) * 100) / 100 : 0,
     }))
 
   const delta =
     trend.length > 1
-      ? Math.round((trend[trend.length - 1].percent - trend[0].percent) * 10) / 10
+      ? Math.round((trend[trend.length - 1].percent - trend[0].percent) * 100) / 100
       : null
 
   return {
-    average: Math.round(withNames.reduce((sum, row) => sum + row.percent, 0) / withNames.length),
+    average:
+      Math.round((withNames.reduce((sum, row) => sum + row.percent, 0) / withNames.length) * 100) /
+      100,
     worst: sorted[0],
     best: sorted[sorted.length - 1],
     scored: withNames.length,
@@ -103,6 +108,112 @@ const SCALE_TYPES = [
   { type: 'ManagedDevices', label: 'Managed devices' },
 ]
 
+// The nightly orchestrator runs at 03:00, so a tenant that collected yesterday is still healthy;
+// past 48 hours it has missed two runs, and past 72 it has missed three.
+const STALE_HOURS = 48
+const CRITICAL_HOURS = 72
+
+/**
+ * Estate-wide scale totals and per-tenant cache freshness from ListDBCache countsOnly rows. Pure so
+ * the freshness rules can be exercised on their own — the alternative is standing up all seven of
+ * the dashboard's queries to assert on three integers.
+ *
+ * Each stale tenant carries the collections that made it stale, oldest first, so the card can answer
+ * "which one, and when did it last run" without a second request — the rows are already here.
+ */
+export const deriveCacheSummary = (rows, tenants) => {
+  const tenantCount = tenants.length
+  const totals = new Map()
+  const collectionsByTenant = new Map()
+
+  rows.forEach((row) => {
+    const type = row?.Type
+    const count = Number(row?.Count ?? 0)
+    // Scale totals still count every collection — only the age judgement is scoped.
+    if (type) totals.set(type, (totals.get(type) ?? 0) + count)
+    // On-demand, baseline-only and retired types never refresh nightly, so their age means nothing.
+    if (!row?.Tenant || row.Scheduled === false) return
+
+    const ageHours = hoursSince(row?.LastRefresh)
+    if (ageHours === null) return
+    const collections = collectionsByTenant.get(row.Tenant) ?? []
+    collections.push({ type, lastRefresh: row.LastRefresh, ageHours })
+    collectionsByTenant.set(row.Tenant, collections)
+  })
+
+  collectionsByTenant.forEach((collections) => {
+    collections.sort((a, b) => b.ageHours - a.ageHours)
+  })
+
+  const scale = SCALE_TYPES.map(({ type, label }) => ({
+    label,
+    value: totals.get(type) ?? 0,
+    average: tenantCount ? Math.round((totals.get(type) ?? 0) / tenantCount) : 0,
+  }))
+
+  let fresh = 0
+  let stale = 0
+  let missing = 0
+  const staleTenants = []
+
+  // A tenant the cache has never written has no rows at all, so absence is the signal here —
+  // iterate the tenant list rather than the returned rows.
+  tenants.forEach((tenant) => {
+    const domain = tenant?.defaultDomainName
+    const collections = (domain && collectionsByTenant.get(domain)) || []
+    const name = tenant?.displayName || domain
+    const oldest = collections[0]
+
+    if (!oldest) {
+      missing += 1
+      staleTenants.push({
+        name,
+        domain,
+        detail: 'No cached collections found',
+        severity: 'critical',
+        ageHours: null,
+        collections: [],
+      })
+      return
+    }
+
+    const age = oldest.ageHours
+    if (age <= STALE_HOURS) {
+      fresh += 1
+      return
+    }
+
+    stale += 1
+    staleTenants.push({
+      name,
+      domain,
+      detail:
+        age > CRITICAL_HOURS
+          ? `Oldest collection ${Math.round(age / 24)} days old`
+          : `Oldest collection ${Math.round(age)} hours old`,
+      severity: age > CRITICAL_HOURS ? 'critical' : 'warning',
+      ageHours: age,
+      // Only what is actually behind — a tenant that missed one run has three stale collections,
+      // not the eighty that refreshed fine.
+      collections: collections.filter((entry) => entry.ageHours > STALE_HOURS),
+    })
+  })
+
+  // Worst first: never cached, then oldest. The list scrolls rather than truncating at five, so this
+  // order is the triage order.
+  staleTenants.sort((a, b) => {
+    if ((a.ageHours === null) !== (b.ageHours === null)) return a.ageHours === null ? -1 : 1
+    return (b.ageHours ?? 0) - (a.ageHours ?? 0)
+  })
+
+  return {
+    scale,
+    hasData: rows.length > 0,
+    freshness: { fresh, stale, missing },
+    staleTenants,
+  }
+}
+
 /**
  * Every read the All Tenants dashboard performs, plus the derivations each card needs.
  *
@@ -112,31 +223,45 @@ const SCALE_TYPES = [
  */
 
 export const useAllTenantsDashboard = () => {
+  // Every tenant, or the selected tenant group. Calls that take no tenant today get a tenantGroup only for a group.
+  const scope = useMultiTenantScope()
+  const groupOnly = isTenantGroup(scope) ? tenantScope(scope) : {}
   const tenantsApi = ApiGetCall({
     url: '/api/ListTenants',
-    queryKey: 'AllTenantsDashboard-Tenants',
+    data: groupOnly,
+    queryKey: `AllTenantsDashboard-Tenants-${scope}`,
     waiting: true,
   })
 
+  // summary returns the estate roll-up only. The row list is one entry per tenant per standard, and
+  // this card renders four bucket counts, an average, four low scorers and two pending totals.
   const alignmentApi = ApiGetCall({
     url: '/api/ListTenantAlignment',
-    queryKey: 'AllTenantsDashboard-Alignment',
+    data: { summary: true, ...groupOnly },
+    queryKey: `AllTenantsDashboard-Alignment-${scope}`,
     waiting: true,
   })
 
-  // summaryOnly projects away ResultMarkdown/ResultDataJson server-side — this card only counts
-  // rows, and those two columns are unbounded blobs that otherwise dominate the payload.
+  // Same key and TTL as the layout's call so react-query serves one shared copy.
+  const featureFlagsApi = ApiGetCall({
+    url: '/api/ListFeatureFlags',
+    queryKey: 'featureFlags',
+    staleTime: 600000,
+  })
+
+  // countsOnly returns the aggregates with no rows. Deriving them here pulled the estate's whole
+  // failed-test set over the wire, growing linearly with tenant count.
   const failedTestsApi = ApiGetCall({
     url: '/api/ListTestResultsTenants',
-    data: { status: 'Failed', summaryOnly: 'true' },
-    queryKey: 'AllTenantsDashboard-FailedTests',
+    data: { status: 'Failed', countsOnly: 'true', ...groupOnly },
+    queryKey: `AllTenantsDashboard-FailedTests-${scope}`,
     waiting: true,
   })
 
   const domainsApi = ApiGetCall({
     url: '/api/ListDomainAnalyser',
-    data: { tenantFilter: 'AllTenants' },
-    queryKey: 'AllTenantsDashboard-Domains',
+    data: { ...tenantScope(scope) },
+    queryKey: `AllTenantsDashboard-Domains-${scope}`,
     waiting: true,
   })
 
@@ -144,17 +269,22 @@ export const useAllTenantsDashboard = () => {
   // regardless of how many tenants exist.
   const countsApi = ApiGetCall({
     url: '/api/ListDBCache',
-    data: { tenantFilter: 'AllTenants', countsOnly: 'true' },
-    queryKey: 'AllTenantsDashboard-Counts',
+    data: { ...tenantScope(scope), countsOnly: 'true' },
+    queryKey: `AllTenantsDashboard-Counts-${scope}`,
     waiting: true,
   })
 
-  // ListLogs defaults to today's partition when no date is supplied, which keeps this cheap.
+  // ListLogs sits behind CIPP.Logs rather than the sign-in permission; a role without it skips the
+  // call so the dashboard does not surface a 403 for a page the role is allowed to open.
+  const { checkPermissions } = usePermissions()
+  const canReadLogs = checkPermissions(['CIPP.Logs.*'])
+
+  // ListLogs defaults to today's partition when no date is supplied; the first page is enough here.
   const logsApi = ApiGetCall({
     url: '/api/ListLogs',
-    data: { Filter: 'True', Severity: 'Error,Critical' },
-    queryKey: 'AllTenantsDashboard-Logs',
-    waiting: true,
+    data: { Filter: 'True', Severity: 'Error,Critical', ...groupOnly },
+    queryKey: `AllTenantsDashboard-Logs-${scope}`,
+    waiting: canReadLogs,
   })
 
   // Score fields only — the endpoint projects away controlScores, which is ~15 KB per cached record.
@@ -162,8 +292,8 @@ export const useAllTenantsDashboard = () => {
   // find the latest anyway, so the only cost is three more numbers per day per tenant.
   const secureScoreApi = ApiGetCall({
     url: '/api/ListSecureScoreReport',
-    data: { tenantFilter: 'AllTenants', includeHistory: 'true' },
-    queryKey: 'AllTenantsDashboard-SecureScore',
+    data: { ...tenantScope(scope), includeHistory: 'true' },
+    queryKey: `AllTenantsDashboard-SecureScore-${scope}`,
     waiting: true,
   })
 
@@ -226,104 +356,51 @@ export const useAllTenantsDashboard = () => {
   /* ---------------------------------------------------------------- alignment */
 
   const alignment = useMemo(() => {
-    const rows = asArray(alignmentApi.data)
-    const byTenant = new Map()
-    let pendingDeviations = 0
-    const pendingByTenant = new Map()
-
-    // ListTenantAlignment serialises camelCase on the wire even though the PowerShell object that
-    // builds it is PascalCase. Accept both so this keeps working if that ever normalises.
-    rows.forEach((row) => {
-      const key = row?.tenantFilter ?? row?.TenantFilter
-      if (!key) return
-      const score = Number(
-        row?.combinedAlignmentScore ??
-          row?.CombinedScore ??
-          row?.alignmentScore ??
-          row?.AlignmentScore ??
-          0
-      )
-      const existing = byTenant.get(key) ?? { total: 0, count: 0 }
-      byTenant.set(key, {
-        total: existing.total + score,
-        count: existing.count + 1,
-      })
-
-      const pending = Number(row?.pendingDeviationsCount ?? row?.PendingDeviationsCount ?? 0)
-      if (pending > 0) {
-        pendingDeviations += pending
-        pendingByTenant.set(key, (pendingByTenant.get(key) ?? 0) + pending)
-      }
-    })
-
-    const scores = []
-    byTenant.forEach((value, key) => {
-      scores.push({
-        tenant: key,
-        name: displayNameByDomain.get(key) ?? key,
-        score: value.count ? Math.round(value.total / value.count) : 0,
-      })
-    })
-
-    const buckets = { strong: 0, good: 0, weak: 0, poor: 0 }
-    scores.forEach(({ score }) => {
-      if (score >= 90) buckets.strong += 1
-      else if (score >= 75) buckets.good += 1
-      else if (score >= 50) buckets.weak += 1
-      else buckets.poor += 1
-    })
-
-    const average = scores.length
-      ? Math.round(scores.reduce((sum, item) => sum + item.score, 0) / scores.length)
-      : 0
+    const summary = alignmentApi.data ?? {}
+    const buckets = summary.Buckets ?? {}
 
     return {
-      scores,
-      buckets,
-      average,
-      lowest: [...scores].sort((a, b) => a.score - b.score).slice(0, 4),
-      pendingDeviations,
-      pendingTenantCount: pendingByTenant.size,
+      // Only ever read for its length — the endpoint returns the count directly.
+      scores: { length: summary.ScoredTenantCount ?? 0 },
+      buckets: {
+        strong: buckets.Strong ?? 0,
+        good: buckets.Good ?? 0,
+        weak: buckets.Weak ?? 0,
+        poor: buckets.Poor ?? 0,
+      },
+      average: summary.Average ?? 0,
+      lowest: (summary.Lowest ?? []).map((item) => ({
+        tenant: item.Tenant,
+        name: item.Name ?? item.Tenant,
+        score: item.Score ?? 0,
+      })),
+      pendingDeviations: summary.PendingDeviations ?? 0,
+      pendingTenantCount: summary.PendingTenantCount ?? 0,
+      // The Baselines flag hides the classic standards pages and the summary then scores baselines.
+      path: asArray(featureFlagsApi.data).some(
+        (flag) => flag.Id === 'Baselines' && flag.Enabled === true
+      )
+        ? '/tenant/baselines/alignment'
+        : '/tenant/standards/alignment',
     }
-  }, [alignmentApi.data, displayNameByDomain])
+  }, [alignmentApi.data, featureFlagsApi.data])
 
   /* ------------------------------------------------------------- test results */
 
   const tests = useMemo(() => {
-    const rows = asArray(failedTestsApi.data)
-    const identityChecks = new Map()
-    const highRiskTenants = new Set()
-    let high = 0
-
-    rows.forEach((row) => {
-      if (String(row?.Risk ?? '').toLowerCase() === 'high') {
-        high += 1
-        if (row?.Tenant) highRiskTenants.add(row.Tenant)
-      }
-
-      if (String(row?.TestType ?? '').toLowerCase() === 'identity' && row?.Name) {
-        const tenantSet = identityChecks.get(row.Name) ?? new Set()
-        if (row?.Tenant) tenantSet.add(row.Tenant)
-        identityChecks.set(row.Name, tenantSet)
-      }
-    })
-
-    const identityRows = [...identityChecks.entries()]
-      .map(([label, tenantSet]) => ({ label, tenantCount: tenantSet.size }))
-      .sort((a, b) => b.tenantCount - a.tenantCount)
-      .slice(0, 4)
-
-    const identityTenantCount = new Set(
-      rows
-        .filter((row) => String(row?.TestType ?? '').toLowerCase() === 'identity' && row?.Tenant)
-        .map((row) => row.Tenant)
-    ).size
+    const counts = failedTestsApi.data?.Counts ?? {}
+    const byTestType = counts.ByTestType ?? {}
+    // The facet is keyed by the TestType as stored ('Identity'); match without assuming casing.
+    const identityKey = Object.keys(byTestType).find((key) => key.toLowerCase() === 'identity')
+    const identity = (identityKey ? byTestType[identityKey] : null) ?? {}
 
     return {
-      identityRows,
-      identityTenantCount,
-      high,
-      highRiskTenantCount: highRiskTenants.size,
+      identityRows: (identity.TopChecks ?? [])
+        .slice(0, 4)
+        .map((check) => ({ label: check.Name, tenantCount: check.TenantCount })),
+      identityTenantCount: identity.Tenants ?? 0,
+      high: counts.HighRiskFailed ?? 0,
+      highRiskTenantCount: counts.HighRiskTenants ?? 0,
     }
   }, [failedTestsApi.data])
 
@@ -364,74 +441,10 @@ export const useAllTenantsDashboard = () => {
 
   /* ------------------------------------------------------ scale and freshness */
 
-  const cache = useMemo(() => {
-    const rows = asArray(countsApi.data)
-
-    const totals = new Map()
-    const tenantOldest = new Map()
-
-    rows.forEach((row) => {
-      const type = row?.Type
-      const count = Number(row?.Count ?? 0)
-      if (type) totals.set(type, (totals.get(type) ?? 0) + count)
-
-      const age = hoursSince(row?.LastRefresh)
-      if (row?.Tenant && age !== null) {
-        const current = tenantOldest.get(row.Tenant)
-        if (current === undefined || age > current) tenantOldest.set(row.Tenant, age)
-      }
-    })
-
-    const scale = SCALE_TYPES.map(({ type, label }) => ({
-      label,
-      value: totals.get(type) ?? 0,
-      average: tenantCount ? Math.round((totals.get(type) ?? 0) / tenantCount) : 0,
-    }))
-
-    let fresh = 0
-    let stale = 0
-    let missing = 0
-    const staleTenants = []
-
-    // A tenant the cache has never written has no rows at all, so absence is the signal here —
-    // iterate the tenant list rather than the returned rows.
-    tenants.forEach((tenant) => {
-      const domain = tenant?.defaultDomainName
-      const age = domain ? tenantOldest.get(domain) : undefined
-      const name = tenant?.displayName || domain
-      if (age === undefined) {
-        missing += 1
-        staleTenants.push({
-          name,
-          detail: 'No cached collections found',
-          severity: 'critical',
-        })
-      } else if (age > 72) {
-        stale += 1
-        staleTenants.push({
-          name,
-          detail: `Oldest collection ${Math.round(age / 24)} days old`,
-          severity: 'critical',
-        })
-      } else if (age > 30) {
-        stale += 1
-        staleTenants.push({
-          name,
-          detail: `Oldest collection ${Math.round(age)} hours old`,
-          severity: 'warning',
-        })
-      } else {
-        fresh += 1
-      }
-    })
-
-    return {
-      scale,
-      hasData: rows.length > 0,
-      freshness: { fresh, stale, missing },
-      staleTenants: staleTenants.slice(0, 5),
-    }
-  }, [countsApi.data, tenants, tenantCount])
+  const cache = useMemo(
+    () => deriveCacheSummary(asArray(countsApi.data), tenants),
+    [countsApi.data, tenants]
+  )
 
   /* ------------------------------------------------------------ secure score */
 
@@ -443,7 +456,7 @@ export const useAllTenantsDashboard = () => {
   /* -------------------------------------------------------------------- logs */
 
   const logs = useMemo(() => {
-    const rows = asArray(logsApi.data).filter((row) =>
+    const rows = asArray(logsApi.data?.Results).filter((row) =>
       ['error', 'critical'].includes(String(row?.Severity ?? '').toLowerCase())
     )
 
@@ -526,6 +539,7 @@ export const useAllTenantsDashboard = () => {
   return {
     tenantCount,
     tenants: tenantsApi,
+    canReadLogs,
     alignmentApi,
     failedTestsApi,
     domainsApi,
